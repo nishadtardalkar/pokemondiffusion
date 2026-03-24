@@ -3,10 +3,13 @@ Train a single fully-convolutional denoising diffusion model on a multi-resoluti
 Pokémon dataset: resolutions 1, 2, 4, …, 128 (powers of two).
 
 Each training step picks a scale H×H, diffuses noise on that image, and predicts
-noise with the same CNN at arbitrary H. Optional conditioning is the parent
-(H/2)×(H/2) image nearest-neighbor upsampled to H×H (zeros at 1×1).
+noise with the same CNN at arbitrary H. Parent (H/2)² is doubled with a
+learned ``ConvTranspose2d(2, 2)`` (no implicit spatial pad like 3×3 on 1×1).
 
-Sampling runs DDPM at 1×1, then nearest upsample + noise and repeat up to 128×128.
+At 1×1 the denoiser uses only 1×1 convolutions; at larger H it uses 3×3.
+Sampling uses the same transpose for chain upsampling. Post-epoch inference
+uses Gaussian 1×1 starts so the prior matches DDPM training (uniform [0,1]
+biases the sampler toward flat outputs).
 """
 
 from __future__ import annotations
@@ -120,18 +123,13 @@ class MultiResSpriteDataset(Dataset):
         x0 = self._load_rgb_tensor(x_path)
 
         if h == 1:
-            cond = torch.zeros_like(x0)
+            cond_low = torch.zeros(3, 1, 1, dtype=x0.dtype)
         else:
             h_half = h // 2
             c_path = self.root / str(h_half) / f"{pid}.png"
             cond_low = self._load_rgb_tensor(c_path)
-            cond = F.interpolate(
-                cond_low.unsqueeze(0),
-                size=(h, h),
-                mode="nearest",
-            ).squeeze(0)
 
-        return {"x0": x0, "cond": cond, "res": h}
+        return {"x0": x0, "cond_low": cond_low, "res": torch.tensor(h, dtype=torch.long)}
 
 
 def sinusoidal_time_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
@@ -149,22 +147,29 @@ def sinusoidal_time_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 class ResBlock(nn.Module):
-    """Same-resolution conv block; time injected as channel bias."""
+    """
+    Same-resolution residual block. Uses 1×1 convs when H=W=1 (no implicit
+    reflect/zero pad from 3×3); otherwise 3×3 with padding 1.
+    """
 
     def __init__(self, channels: int, time_dim: int) -> None:
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv3a = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv3b = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv1a = nn.Conv2d(channels, channels, kernel_size=1)
+        self.conv1b = nn.Conv2d(channels, channels, kernel_size=1)
         self.norm1 = nn.GroupNorm(min(8, channels), channels)
         self.norm2 = nn.GroupNorm(min(8, channels), channels)
         self.time_proj = nn.Linear(time_dim, channels)
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(x)
+        tiny = x.shape[-2] == 1 and x.shape[-1] == 1
+        c1, c2 = (self.conv1a, self.conv1b) if tiny else (self.conv3a, self.conv3b)
+        h = c1(x)
         h = h + self.time_proj(t_emb)[:, :, None, None]
         h = self.norm1(h)
         h = F.silu(h)
-        h = self.conv2(h)
+        h = c2(h)
         h = self.norm2(h)
         h = F.silu(h)
         return x + h
@@ -174,6 +179,9 @@ class FullyConvDenoiser(nn.Module):
     """
     ε-predictor: same spatial size as noisy x. Always 6 input channels:
     [noisy RGB | condition RGB]; condition is zeros at 1×1.
+
+    Parent resolution doubling uses ``ConvTranspose2d`` (stride 2), shared for
+    training conditioning and progressive sampling (no nearest resize).
     """
 
     def __init__(
@@ -189,26 +197,43 @@ class FullyConvDenoiser(nn.Module):
             nn.SiLU(),
             nn.Linear(time_dim, time_dim),
         )
-        self.in_conv = nn.Conv2d(in_channels, base, kernel_size=3, padding=1)
+        self.in_conv3 = nn.Conv2d(in_channels, base, kernel_size=3, padding=1)
+        self.in_conv1 = nn.Conv2d(in_channels, base, kernel_size=1)
+        self.parent_up = nn.ConvTranspose2d(3, 3, kernel_size=2, stride=2, bias=True)
+        self._init_parent_up_nearest()
         self.blocks = nn.ModuleList([ResBlock(base, time_dim) for _ in range(num_blocks)])
         self.out_norm = nn.GroupNorm(min(8, base), base)
-        self.out_conv = nn.Conv2d(base, 3, kernel_size=3, padding=1)
+        self.out_conv3 = nn.Conv2d(base, 3, kernel_size=3, padding=1)
+        self.out_conv1 = nn.Conv2d(base, 3, kernel_size=1)
+
+    def _init_parent_up_nearest(self) -> None:
+        """Bias-free init so each parent pixel is copied to a 2×2 block (nearest ×2)."""
+        with torch.no_grad():
+            self.parent_up.weight.zero_()
+            self.parent_up.bias.zero_()
+            for c in range(3):
+                self.parent_up.weight[c, c, :, :] = 1.0
+
+    def upsample_parent(self, low: torch.Tensor) -> torch.Tensor:
+        """(B, 3, H, H) -> (B, 3, 2H, 2H)."""
+        return self.parent_up(low)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         """
         x: (B, 3, H, W) noisy
-        cond: (B, 3, H, W) parent upsampled (or zeros)
+        cond: (B, 3, H, W) parent doubled to H (or zeros at 1×1)
         t: (B,) int64 timesteps
         """
         t_emb = sinusoidal_time_embedding(t, self.time_mlp[0].in_features)
         t_emb = self.time_mlp(t_emb)
         h = torch.cat([x, cond], dim=1)
-        h = self.in_conv(h)
+        tiny = x.shape[-2] == 1 and x.shape[-1] == 1
+        h = self.in_conv1(h) if tiny else self.in_conv3(h)
         for blk in self.blocks:
             h = blk(h, t_emb)
         h = self.out_norm(h)
         h = F.silu(h)
-        return self.out_conv(h)
+        return self.out_conv1(h) if tiny else self.out_conv3(h)
 
 
 class GaussianDDPM:
@@ -260,20 +285,33 @@ class GaussianDDPM:
 
 
 def train_step(
-    model: nn.Module,
+    model: FullyConvDenoiser,
     ddpm: GaussianDDPM,
     batch: dict,
     optimizer: torch.optim.Optimizer,
+    aux_up_weight: float = 0.1,
 ) -> float:
     model.train()
-    x0 = batch["x0"].to(ddpm.device)
-    cond = batch["cond"].to(ddpm.device)
+    device = ddpm.device
+    x0 = batch["x0"].to(device)
+    cond_low = batch["cond_low"].to(device)
+    res_h = int(batch["res"][0].item())
+
+    if res_h == 1:
+        cond = torch.zeros_like(x0)
+    else:
+        cond = model.upsample_parent(cond_low)
+        tgt_nn = F.interpolate(cond_low, size=x0.shape[-2:], mode="nearest")
+        aux = F.mse_loss(cond, tgt_nn)
     b = x0.shape[0]
-    t = torch.randint(0, ddpm.T, (b,), device=ddpm.device, dtype=torch.long)
+    t = torch.randint(0, ddpm.T, (b,), device=device, dtype=torch.long)
     noise = torch.randn_like(x0)
     x_t = ddpm.q_sample(x0, t, noise)
     pred = model(x_t, t, cond)
     loss = F.mse_loss(pred, noise)
+    if res_h > 1:
+        loss = loss + aux_up_weight * aux
+
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -293,9 +331,9 @@ def inference(
     """
     Progressive sampling: 1×1 → … → 128×128 with the same denoiser at each scale.
 
-    If ``init_1x1`` is set, it must be ``(B, 3, 1, 1)`` and is used as the noisy
-    starting state for the first DDPM loop (e.g. random RGB in ``[0, 1]``).
-    Otherwise ``batch_size`` is required and the start is Gaussian ``N(0, I)``.
+    If ``init_1x1`` is set, it must be ``(B, 3, 1, 1)`` and is used as the first
+    DDPM state (use ``N(0,I)`` to match training; uniform ``[0,1]`` does not).
+    Otherwise ``batch_size`` is required and the start is Gaussian noise.
     """
     model.eval()
     device = ddpm.device
@@ -322,7 +360,7 @@ def inference(
             cond = torch.zeros_like(x)
         else:
             assert prev_clean is not None
-            mean_up = F.interpolate(prev_clean, size=(h, h), mode="nearest")
+            mean_up = model.upsample_parent(prev_clean)
             x = mean_up + noise_scale_next * torch.randn(batch_size, 3, h, h, device=device)
             cond = mean_up
 
@@ -360,7 +398,7 @@ def parse_args() -> argparse.Namespace:
         "--inference-batch",
         type=int,
         default=4,
-        help="batch size for post-epoch inference (random 1×1 RGB starters)",
+        help="batch size for post-epoch inference (Gaussian 1×1 init, DDPM-consistent)",
     )
     return p.parse_args()
 
@@ -401,11 +439,11 @@ def main() -> None:
         tqdm.write(f"epoch {epoch}/{args.epochs}  mean loss={avg:.5f}")
 
         ib = max(1, args.inference_batch)
-        rand_1x1 = torch.rand(ib, 3, 1, 1, device=device)
-        gen = inference(model, ddpm, init_1x1=rand_1x1, noise_scale_next=args.noise_next)
+        noise_1x1 = torch.randn(ib, 3, 1, 1, device=device)
+        gen = inference(model, ddpm, init_1x1=noise_1x1, noise_scale_next=args.noise_next)
         inf_path = Path(f"inference_epoch_{epoch}.png")
         save_inference_grid(gen, inf_path)
-        tqdm.write(f"  inference ({ib} random 1×1 starters) -> {inf_path.resolve()}")
+        tqdm.write(f"  inference ({ib}× N(0,I) at 1×1) -> {inf_path.resolve()}")
 
         if args.sample_every > 0 and epoch % args.sample_every == 0:
             imgs = inference(
