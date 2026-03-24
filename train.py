@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 
 class SameResolutionBatchSampler:
@@ -281,24 +282,43 @@ def train_step(
 
 
 @torch.no_grad()
-def sample_progressive(
+def inference(
     model: nn.Module,
     ddpm: GaussianDDPM,
-    batch_size: int,
+    batch_size: int | None = None,
+    *,
+    init_1x1: torch.Tensor | None = None,
     noise_scale_next: float = 0.2,
 ) -> torch.Tensor:
     """
-    Generate (B, 3, 128, 128): DDPM at each scale, then nearest ×2 between scales.
-    Initial 2×2 etc. latents mix prior mean (upsampled parent) with Gaussian noise.
+    Progressive sampling: 1×1 → … → 128×128 with the same denoiser at each scale.
+
+    If ``init_1x1`` is set, it must be ``(B, 3, 1, 1)`` and is used as the noisy
+    starting state for the first DDPM loop (e.g. random RGB in ``[0, 1]``).
+    Otherwise ``batch_size`` is required and the start is Gaussian ``N(0, I)``.
     """
     model.eval()
     device = ddpm.device
     chain = list(RESOLUTIONS)
+
+    if init_1x1 is not None:
+        z = init_1x1.to(device)
+        if z.ndim != 4 or z.shape[1:] != (3, 1, 1):
+            raise ValueError(f"init_1x1 must be (B, 3, 1, 1), got {tuple(z.shape)}")
+        b = z.shape[0]
+        if batch_size is not None and b != batch_size:
+            raise ValueError(f"batch_size={batch_size} but init_1x1 has batch {b}")
+        batch_size = b
+    else:
+        if batch_size is None:
+            raise ValueError("inference requires batch_size when init_1x1 is None")
+        z = torch.randn(batch_size, 3, 1, 1, device=device)
+
     prev_clean: torch.Tensor | None = None
 
     for si, h in enumerate(chain):
         if si == 0:
-            x = torch.randn(batch_size, 3, h, h, device=device)
+            x = z
             cond = torch.zeros_like(x)
         else:
             assert prev_clean is not None
@@ -310,7 +330,17 @@ def sample_progressive(
             x = ddpm.p_sample_step(model, x, t_, cond)
         prev_clean = x
 
+    assert prev_clean is not None
     return prev_clean
+
+
+def save_inference_grid(imgs: torch.Tensor, path: Path) -> None:
+    """Save ``(B, 3, H, W)`` in ``[0, 1]`` as one horizontal PNG."""
+    imgs = imgs.clamp(0, 1).cpu()
+    row = torch.cat([imgs[i] for i in range(imgs.shape[0])], dim=-1)
+    arr = (row.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(arr).save(path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -326,6 +356,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--sample-every", type=int, default=0, help="if >0, save sample grid every N epochs")
     p.add_argument("--noise-next", type=float, default=0.2, help="noise multiplier after upsample between scales")
+    p.add_argument(
+        "--inference-batch",
+        type=int,
+        default=4,
+        help="batch size for post-epoch inference (random 1×1 RGB starters)",
+    )
     return p.parse_args()
 
 
@@ -355,17 +391,32 @@ def main() -> None:
 
     for epoch in range(1, args.epochs + 1):
         losses: list[float] = []
-        for batch in loader:
-            losses.append(train_step(model, ddpm, batch, optimizer))
+        pbar = tqdm(loader, desc=f"epoch {epoch}/{args.epochs}", leave=True)
+        for batch in pbar:
+            loss = train_step(model, ddpm, batch, optimizer)
+            losses.append(loss)
+            run_avg = float(np.mean(losses))
+            pbar.set_postfix(loss=f"{loss:.5f}", epoch_avg=f"{run_avg:.5f}")
         avg = float(np.mean(losses)) if losses else 0.0
-        print(f"epoch {epoch}/{args.epochs}  loss={avg:.5f}")
+        tqdm.write(f"epoch {epoch}/{args.epochs}  mean loss={avg:.5f}")
+
+        ib = max(1, args.inference_batch)
+        rand_1x1 = torch.rand(ib, 3, 1, 1, device=device)
+        gen = inference(model, ddpm, init_1x1=rand_1x1, noise_scale_next=args.noise_next)
+        inf_path = Path(f"inference_epoch_{epoch}.png")
+        save_inference_grid(gen, inf_path)
+        tqdm.write(f"  inference ({ib} random 1×1 starters) -> {inf_path.resolve()}")
 
         if args.sample_every > 0 and epoch % args.sample_every == 0:
-            imgs = sample_progressive(model, ddpm, batch_size=min(4, args.batch_size), noise_scale_next=args.noise_next)
-            # simple debug grid: first image only saved as PNG
-            out = (imgs[0].clamp(0, 1).cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            Image.fromarray(out).save(f"sample_epoch_{epoch}.png")
-            print(f"  wrote sample_epoch_{epoch}.png")
+            imgs = inference(
+                model,
+                ddpm,
+                batch_size=min(4, args.batch_size),
+                noise_scale_next=args.noise_next,
+            )
+            spath = Path(f"sample_epoch_{epoch}.png")
+            save_inference_grid(imgs[:4], spath)
+            tqdm.write(f"  Gaussian-init sample -> {spath.resolve()}")
 
     payload = {
         "model": model.state_dict(),
